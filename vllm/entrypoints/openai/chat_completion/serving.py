@@ -1373,11 +1373,21 @@ class OpenAIServingChat(OpenAIServing):
                 continue
 
             if reasoning_parser:
+                # Match the streaming path: if the prompt already ended
+                # reasoning, route the generated suffix directly as content.
+                prompt_is_reasoning_end = bool(
+                    final_res.prompt_token_ids
+                    and reasoning_parser.is_reasoning_end(final_res.prompt_token_ids)
+                )
+
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
-                reasoning, content = reasoning_parser.extract_reasoning(
-                    output.text, request=request
-                )
+                if prompt_is_reasoning_end:
+                    reasoning, content = None, output.text
+                else:
+                    reasoning, content = reasoning_parser.extract_reasoning(
+                        output.text, request=request
+                    )
                 if not request.include_reasoning:
                     reasoning = None
             else:
