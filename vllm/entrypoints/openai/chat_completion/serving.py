@@ -1335,6 +1335,7 @@ class OpenAIServingChat(OpenAIServing):
                     chat_template_kwargs=chat_template_kwargs,
                     continue_final_message=request.continue_final_message,
                 )
+                harmony_content = content
                 if not request.include_reasoning:
                     reasoning = None
 
@@ -1351,7 +1352,10 @@ class OpenAIServingChat(OpenAIServing):
                         request=request,
                         token_ids=token_ids,  # type: ignore
                     )
-                    content = tool_call_info.content
+                    if tool_call_info.tools_called:
+                        content = tool_call_info.content
+                    else:
+                        content = harmony_content
                 if (
                     request.echo
                     and request.continue_final_message
