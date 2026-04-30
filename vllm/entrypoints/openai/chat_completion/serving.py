@@ -57,9 +57,11 @@ from vllm.entrypoints.openai.engine.serving import (
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
+    get_final_prefill_content,
+    get_harmony_completion_channel,
     get_stop_tokens_for_assistant_actions,
     get_streamable_parser_for_assistant,
-    parse_chat_output,
+    parse_chat_output_with_prefill,
 )
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
@@ -376,6 +378,7 @@ class OpenAIServingChat(OpenAIServing):
             tokenizer,
             request_metadata,
             reasoning_parser,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -1280,6 +1283,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
@@ -1325,7 +1329,12 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = None
 
             if self.use_harmony:
-                reasoning, content, _ = parse_chat_output(token_ids)
+                reasoning, content, _ = parse_chat_output_with_prefill(
+                    token_ids,
+                    chat_msgs=request.messages,
+                    chat_template_kwargs=chat_template_kwargs,
+                    continue_final_message=request.continue_final_message,
+                )
                 if not request.include_reasoning:
                     reasoning = None
 
@@ -1343,6 +1352,21 @@ class OpenAIServingChat(OpenAIServing):
                         token_ids=token_ids,  # type: ignore
                     )
                     content = tool_call_info.content
+                if (
+                    request.echo
+                    and request.continue_final_message
+                    and get_harmony_completion_channel(
+                        request.messages,
+                        chat_template_kwargs,
+                        continue_final_message=True,
+                    )
+                    == "final"
+                ):
+                    final_prefill = get_final_prefill_content(request.messages)
+                    if final_prefill:
+                        content = final_prefill + (content or "")
+
+                if self.tool_parser is not None:
                     message = ChatMessage(
                         role=role,
                         reasoning=reasoning,

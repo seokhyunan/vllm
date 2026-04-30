@@ -22,7 +22,8 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     get_developer_message,
     get_system_message,
     parse_chat_inputs_to_harmony_messages,
-    render_for_completion,
+    render_for_chat_completion,
+    should_preserve_last_assistant_analysis,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.serve.disagg.mm_serde import encode_mm_kwargs_item
@@ -427,11 +428,30 @@ class OpenAIServingRender:
             )
             messages.append(dev_msg)
 
+        chat_template_kwargs = merge_kwargs(
+            self.default_chat_template_kwargs,
+            request.chat_template_kwargs,
+        )
+
         # Add user message.
-        messages.extend(parse_chat_inputs_to_harmony_messages(request.messages))
+        messages.extend(
+            parse_chat_inputs_to_harmony_messages(
+                request.messages,
+                preserve_last_assistant_analysis=should_preserve_last_assistant_analysis(
+                    request.messages,
+                    chat_template_kwargs,
+                    continue_final_message=request.continue_final_message,
+                ),
+            )
+        )
 
         # Render prompt token ids.
-        prompt_token_ids = render_for_completion(messages)
+        prompt_token_ids = render_for_chat_completion(
+            messages,
+            chat_template_kwargs=chat_template_kwargs,
+            add_generation_prompt=request.add_generation_prompt,
+            continue_final_message=request.continue_final_message,
+        )
         engine_input = tokens_input(prompt_token_ids, cache_salt=request.cache_salt)
 
         return messages, [engine_input]
