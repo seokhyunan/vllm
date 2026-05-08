@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import datetime
-from collections.abc import Iterable, Sequence
-from typing import Literal
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, Literal
 
 from openai.types.responses.tool import Tool
 from openai_harmony import (
@@ -13,6 +13,7 @@ from openai_harmony import (
     HarmonyEncodingName,
     Message,
     ReasoningEffort,
+    RenderConversationConfig,
     Role,
     StreamableParser,
     SystemContent,
@@ -47,6 +48,8 @@ BUILTIN_TOOL_TO_MCP_SERVER_LABEL: dict[str, str] = {
 
 # Derive MCP_BUILTIN_TOOLS from the canonical mapping
 MCP_BUILTIN_TOOLS: set[str] = set(BUILTIN_TOOL_TO_MCP_SERVER_LABEL.values())
+HARMONY_CHANNELS = ("analysis", "final", "commentary")
+HARMONY_END = "<|end|>"
 
 
 def has_custom_tools(tool_types: set[str]) -> bool:
@@ -154,7 +157,11 @@ def get_user_message(content: str) -> Message:
     return Message.from_role_and_content(Role.USER, content)
 
 
-def parse_chat_inputs_to_harmony_messages(chat_msgs: list) -> list[Message]:
+def parse_chat_inputs_to_harmony_messages(
+    chat_msgs: list,
+    *,
+    preserve_last_assistant_analysis: bool = False,
+) -> list[Message]:
     """
     Parse a list of messages from request.messages in the Chat Completion API to
     Harmony messages.
@@ -172,11 +179,18 @@ def parse_chat_inputs_to_harmony_messages(chat_msgs: list) -> list[Message]:
     for chat_msg in chat_msgs:
         msgs.extend(parse_chat_input_to_harmony_message(chat_msg, tool_id_names))
 
-    msgs = auto_drop_analysis_messages(msgs)
+    msgs = auto_drop_analysis_messages(
+        msgs,
+        preserve_last_assistant_analysis=preserve_last_assistant_analysis,
+    )
     return msgs
 
 
-def auto_drop_analysis_messages(msgs: list[Message]) -> list[Message]:
+def auto_drop_analysis_messages(
+    msgs: list[Message],
+    *,
+    preserve_last_assistant_analysis: bool = False,
+) -> list[Message]:
     """
     Harmony models expect the analysis messages (representing raw chain of thought) to
     be dropped after an assistant message to the final channel is produced from the
@@ -199,9 +213,19 @@ def auto_drop_analysis_messages(msgs: list[Message]) -> list[Message]:
             last_assistant_final_index = i
             break
 
+    first_preserved_index = last_assistant_final_index
+    if preserve_last_assistant_analysis and last_assistant_final_index == len(msgs) - 1:
+        prev_idx = last_assistant_final_index - 1
+        if (
+            prev_idx >= 0
+            and msgs[prev_idx].author.role == "assistant"
+            and msgs[prev_idx].channel == "analysis"
+        ):
+            first_preserved_index = prev_idx
+
     cleaned_msgs: list[Message] = []
     for i, msg in enumerate(msgs):
-        if i < last_assistant_final_index and msg.channel == "analysis":
+        if i < first_preserved_index and msg.channel == "analysis":
             continue
         cleaned_msgs.append(msg)
 
@@ -322,6 +346,196 @@ def render_for_completion(messages: list[Message]) -> list[int]:
         conversation, Role.ASSISTANT
     )
     return token_ids
+
+
+def _encode_harmony(text: str) -> list[int]:
+    return get_encoding().encode(text, allowed_special="all")
+
+
+def _harmony_channel_prefix(channel: str) -> str:
+    return f"<|channel|>{channel}<|message|>"
+
+
+def _harmony_assistant_channel_prefix(channel: str) -> str:
+    return f"<|start|>assistant{_harmony_channel_prefix(channel)}"
+
+
+def _strip_trailing_end_token(token_ids: list[int]) -> list[int]:
+    end_token_ids = _encode_harmony(HARMONY_END)
+    if (
+        len(token_ids) >= len(end_token_ids)
+        and token_ids[-len(end_token_ids) :] == end_token_ids
+    ):
+        return token_ids[: -len(end_token_ids)]
+    return token_ids
+
+
+def _render_conversation_without_auto_drop(messages: list[Message]) -> list[int]:
+    return get_encoding().render_conversation(
+        Conversation.from_messages(messages),
+        RenderConversationConfig(auto_drop_analysis=False),
+    )
+
+
+def _last_assistant_channel(messages: Sequence[Message]) -> str | None:
+    for msg in reversed(messages):
+        if msg.author.role == "assistant":
+            return msg.channel
+    return None
+
+
+def _get_harmony_continuation_mode(
+    chat_template_kwargs: Mapping[str, Any] | None,
+) -> Literal["from_reasoning", "from_answer"] | None:
+    if not chat_template_kwargs:
+        return None
+    continuation_mode = chat_template_kwargs.get("continuation_mode")
+    if continuation_mode in ("from_reasoning", "from_answer"):
+        return continuation_mode
+    return None
+
+
+def _is_harmony_thinking_enabled(
+    chat_template_kwargs: Mapping[str, Any] | None,
+) -> bool:
+    if not chat_template_kwargs:
+        return True
+    return chat_template_kwargs.get("enable_thinking") is not False
+
+
+def get_harmony_completion_channel(
+    chat_msgs: list | None = None,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+    *,
+    continue_final_message: bool = False,
+) -> Literal["analysis", "final"]:
+    continuation_mode = _get_harmony_continuation_mode(chat_template_kwargs)
+    if continue_final_message:
+        if continuation_mode == "from_reasoning":
+            return "analysis"
+        if continuation_mode == "from_answer":
+            return "final"
+        if chat_msgs:
+            last_msg = chat_msgs[-1]
+            if not isinstance(last_msg, dict):
+                last_msg = last_msg.model_dump(exclude_none=True)
+            if last_msg.get("role") == "assistant":
+                if flatten_chat_text_content(last_msg.get("content")):
+                    return "final"
+                if last_msg.get("reasoning"):
+                    return "analysis"
+    return "analysis" if _is_harmony_thinking_enabled(chat_template_kwargs) else "final"
+
+
+def _render_open_harmony_channel(
+    messages: list[Message],
+    channel: Literal["analysis", "final"],
+) -> list[int]:
+    if _last_assistant_channel(messages) == channel:
+        token_ids = _render_conversation_without_auto_drop(messages)
+        return _strip_trailing_end_token(token_ids)
+
+    token_ids = render_for_completion(messages)
+    token_ids.extend(_encode_harmony(_harmony_channel_prefix(channel)))
+    return token_ids
+
+
+def render_for_chat_completion(
+    messages: list[Message],
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+    add_generation_prompt: bool = True,
+    continue_final_message: bool = False,
+) -> list[int]:
+    if continue_final_message:
+        channel = get_harmony_completion_channel(
+            chat_template_kwargs=chat_template_kwargs,
+            continue_final_message=True,
+        )
+        if _get_harmony_continuation_mode(chat_template_kwargs) is None:
+            last_channel = _last_assistant_channel(messages)
+            if last_channel in ("analysis", "final"):
+                channel = last_channel
+
+        if channel == "analysis":
+            return _render_open_harmony_channel(messages, "analysis")
+
+        if _last_assistant_channel(messages) == "final":
+            token_ids = _render_conversation_without_auto_drop(messages)
+            return _strip_trailing_end_token(token_ids)
+
+        token_ids = _render_conversation_without_auto_drop(messages)
+        token_ids.extend(_encode_harmony(_harmony_assistant_channel_prefix("final")))
+        return token_ids
+
+    if not add_generation_prompt:
+        return _render_conversation_without_auto_drop(messages)
+
+    channel = get_harmony_completion_channel(chat_template_kwargs=chat_template_kwargs)
+    return _render_open_harmony_channel(messages, channel)
+
+
+def should_preserve_last_assistant_analysis(
+    chat_msgs: list,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+    *,
+    continue_final_message: bool = False,
+) -> bool:
+    if not continue_final_message:
+        return False
+    if _get_harmony_continuation_mode(chat_template_kwargs) != "from_answer":
+        return False
+    if not chat_msgs:
+        return False
+    last_msg = chat_msgs[-1]
+    if not isinstance(last_msg, dict):
+        last_msg = last_msg.model_dump(exclude_none=True)
+    return last_msg.get("role") == "assistant" and bool(last_msg.get("reasoning"))
+
+
+def _starts_with_harmony_message_header(token_ids: Sequence[int]) -> bool:
+    for prefix in (
+        "<|start|>assistant",
+        *[f"<|channel|>{channel}" for channel in HARMONY_CHANNELS],
+    ):
+        prefix_token_ids = _encode_harmony(prefix)
+        if (
+            len(token_ids) >= len(prefix_token_ids)
+            and list(token_ids[: len(prefix_token_ids)]) == prefix_token_ids
+        ):
+            return True
+    return False
+
+
+def parse_chat_output_with_prefill(
+    token_ids: Sequence[int],
+    *,
+    chat_msgs: list | None = None,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+    continue_final_message: bool = False,
+) -> tuple[str | None, str | None, bool]:
+    if _starts_with_harmony_message_header(token_ids):
+        return parse_chat_output(token_ids)
+
+    channel = get_harmony_completion_channel(
+        chat_msgs,
+        chat_template_kwargs,
+        continue_final_message=continue_final_message,
+    )
+    prefixed_token_ids = _encode_harmony(_harmony_channel_prefix(channel))
+    prefixed_token_ids.extend(token_ids)
+    return parse_chat_output(prefixed_token_ids)
+
+
+def get_final_prefill_content(chat_msgs: list) -> str | None:
+    if not chat_msgs:
+        return None
+    last_msg = chat_msgs[-1]
+    if not isinstance(last_msg, dict):
+        last_msg = last_msg.model_dump(exclude_none=True)
+    if last_msg.get("role") != "assistant":
+        return None
+    return flatten_chat_text_content(last_msg.get("content")) or None
 
 
 def get_stop_tokens_for_assistant_actions() -> list[int]:
