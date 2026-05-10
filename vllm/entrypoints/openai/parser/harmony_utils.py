@@ -507,15 +507,16 @@ def _starts_with_harmony_message_header(token_ids: Sequence[int]) -> bool:
     return False
 
 
-def parse_chat_output_with_prefill(
+def normalize_chat_output_with_prefill(
     token_ids: Sequence[int],
     *,
     chat_msgs: list | None = None,
     chat_template_kwargs: Mapping[str, Any] | None = None,
     continue_final_message: bool = False,
-) -> tuple[str | None, str | None, bool]:
-    if _starts_with_harmony_message_header(token_ids):
-        return parse_chat_output(token_ids)
+) -> list[int]:
+    normalized_token_ids = list(token_ids)
+    if _starts_with_harmony_message_header(normalized_token_ids):
+        return normalized_token_ids
 
     channel = get_harmony_completion_channel(
         chat_msgs,
@@ -523,8 +524,25 @@ def parse_chat_output_with_prefill(
         continue_final_message=continue_final_message,
     )
     prefixed_token_ids = _encode_harmony(_harmony_channel_prefix(channel))
-    prefixed_token_ids.extend(token_ids)
-    return parse_chat_output(prefixed_token_ids)
+    prefixed_token_ids.extend(normalized_token_ids)
+    return prefixed_token_ids
+
+
+def parse_chat_output_with_prefill(
+    token_ids: Sequence[int],
+    *,
+    chat_msgs: list | None = None,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+    continue_final_message: bool = False,
+) -> tuple[str | None, str | None, bool]:
+    return parse_chat_output(
+        normalize_chat_output_with_prefill(
+            token_ids,
+            chat_msgs=chat_msgs,
+            chat_template_kwargs=chat_template_kwargs,
+            continue_final_message=continue_final_message,
+        )
+    )
 
 
 def get_final_prefill_content(chat_msgs: list) -> str | None:

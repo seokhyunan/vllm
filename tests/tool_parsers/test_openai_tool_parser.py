@@ -15,6 +15,10 @@ from openai_harmony import (
 )
 
 from vllm.entrypoints.openai.engine.protocol import FunctionCall, ToolCall
+from vllm.entrypoints.openai.parser.harmony_utils import (
+    get_encoding,
+    normalize_chat_output_with_prefill,
+)
 from vllm.tokenizers import get_tokenizer
 from vllm.tool_parsers.openai_tool_parser import OpenAIToolParser
 
@@ -80,6 +84,86 @@ def test_extract_tool_calls_no_tools(openai_tool_parser, harmony_encoding):
     assert not extracted_info.tools_called
     assert extracted_info.tool_calls == []
     assert extracted_info.content == "This is a test"
+
+
+def test_extract_tool_calls_with_partial_reasoning_prefill_final(
+    openai_tool_parser,
+):
+    harmony_str = (
+        " 2. Provide the short answer.<|end|>"
+        "<|start|>assistant<|channel|>final<|message|>2<|return|>"
+    )
+    token_ids = get_encoding().encode(harmony_str, allowed_special="all")
+    normalized_token_ids = normalize_chat_output_with_prefill(
+        token_ids,
+        chat_msgs=[
+            {"role": "user", "content": "What is 1 + 1?"},
+            {
+                "role": "assistant",
+                "reasoning": "We know 1 + 1 is",
+                "content": "",
+            },
+        ],
+        chat_template_kwargs={
+            "continuation_mode": "from_reasoning",
+            "enable_thinking": True,
+        },
+        continue_final_message=True,
+    )
+
+    extracted_info = openai_tool_parser.extract_tool_calls(
+        "",
+        request=None,
+        token_ids=normalized_token_ids,
+    )
+    assert not extracted_info.tools_called
+    assert extracted_info.tool_calls == []
+    assert extracted_info.content == "2"
+
+
+def test_extract_tool_calls_with_partial_reasoning_prefill_tool_call(
+    openai_tool_parser,
+):
+    tool_args = '{"location": "Paris"}'
+    harmony_str = (
+        " check the weather.<|end|>"
+        "<|start|>assistant to=functions.get_weather<|channel|>commentary"
+        f"<|constrain|>json<|message|>{tool_args}<|call|>"
+    )
+    token_ids = get_encoding().encode(harmony_str, allowed_special="all")
+    normalized_token_ids = normalize_chat_output_with_prefill(
+        token_ids,
+        chat_msgs=[
+            {"role": "user", "content": "What is the weather in Paris?"},
+            {
+                "role": "assistant",
+                "reasoning": "We should",
+                "content": "",
+            },
+        ],
+        chat_template_kwargs={
+            "continuation_mode": "from_reasoning",
+            "enable_thinking": True,
+        },
+        continue_final_message=True,
+    )
+
+    extracted_info = openai_tool_parser.extract_tool_calls(
+        "",
+        request=None,
+        token_ids=normalized_token_ids,
+    )
+    assert extracted_info.tools_called
+    expected_tool_calls = [
+        ToolCall(
+            function=FunctionCall(
+                name="get_weather",
+                arguments=json.dumps({"location": "Paris"}),
+            )
+        )
+    ]
+    assert_tool_calls(extracted_info.tool_calls, expected_tool_calls)
+    assert extracted_info.content is None
 
 
 @pytest.mark.parametrize(

@@ -61,7 +61,8 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     get_harmony_completion_channel,
     get_stop_tokens_for_assistant_actions,
     get_streamable_parser_for_assistant,
-    parse_chat_output_with_prefill,
+    normalize_chat_output_with_prefill,
+    parse_chat_output,
 )
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
@@ -1334,12 +1335,13 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = None
 
             if self.use_harmony:
-                reasoning, content, _ = parse_chat_output_with_prefill(
+                harmony_token_ids = normalize_chat_output_with_prefill(
                     token_ids,
                     chat_msgs=request.messages,
                     chat_template_kwargs=chat_template_kwargs,
                     continue_final_message=request.continue_final_message,
                 )
+                reasoning, content, _ = parse_chat_output(harmony_token_ids)
                 harmony_content = content
                 if not request.include_reasoning:
                     reasoning = None
@@ -1351,11 +1353,11 @@ class OpenAIServingChat(OpenAIServing):
                         )
 
                     tool_parser = self.tool_parser(tokenizer, request.tools)
-                    # NOTE: We use token_ids for openai tool parser
+                    # NOTE: OpenAI tool parser requires Harmony token IDs.
                     tool_call_info = tool_parser.extract_tool_calls(
                         "",
                         request=request,
-                        token_ids=token_ids,  # type: ignore
+                        token_ids=harmony_token_ids,  # type: ignore
                     )
                     if tool_call_info.tools_called:
                         content = tool_call_info.content
