@@ -10,6 +10,7 @@ import pytest
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.protocol import (
     TokenizeChatRequest,
@@ -81,13 +82,20 @@ def _build_serving_tokenization(engine: AsyncLLM) -> OpenAIServingTokenization:
     )
 
 
-@pytest.mark.asyncio
-async def test_tokenize_chat_skips_mm_cache_for_renderer_only_path():
+def _build_mock_engine(*, model_type: str = "any") -> AsyncLLM:
     mock_engine = MagicMock(spec=AsyncLLM)
     mock_engine.errored = False
     mock_engine.model_config = MockModelConfig()
+    mock_engine.model_config.hf_config = MockHFConfig(model_type=model_type)
+    mock_engine.model_config.hf_text_config = MockHFConfig(model_type=model_type)
     mock_engine.input_processor = MagicMock()
     mock_engine.renderer = MagicMock()
+    return mock_engine
+
+
+@pytest.mark.asyncio
+async def test_tokenize_chat_skips_mm_cache_for_renderer_only_path():
+    mock_engine = _build_mock_engine()
 
     serving = _build_serving_tokenization(mock_engine)
     serving.openai_serving_render.preprocess_chat = AsyncMock(
@@ -113,11 +121,7 @@ async def test_tokenize_chat_skips_mm_cache_for_renderer_only_path():
 
 @pytest.mark.asyncio
 async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
-    mock_engine = MagicMock(spec=AsyncLLM)
-    mock_engine.errored = False
-    mock_engine.model_config = MockModelConfig()
-    mock_engine.input_processor = MagicMock()
-    mock_engine.renderer = MagicMock()
+    mock_engine = _build_mock_engine()
 
     serving = _build_serving_tokenization(mock_engine)
     serving.openai_serving_render.preprocess_completion = AsyncMock(
@@ -138,3 +142,99 @@ async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
         ]
         is True
     )
+
+
+def _decode_harmony_tokenize_response(response) -> str:
+    return get_encoding().decode(response.tokens)
+
+
+@pytest.mark.asyncio
+async def test_harmony_tokenize_default_thinking_prompt():
+    mock_engine = _build_mock_engine(model_type="gpt_oss")
+    serving = _build_serving_tokenization(mock_engine)
+    serving.openai_serving_render.preprocess_chat = AsyncMock(
+        side_effect=AssertionError("Harmony tokenization must use Harmony rendering")
+    )
+
+    request = TokenizeChatRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "What is 1 + 1?"}],
+        add_generation_prompt=True,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+    prompt = _decode_harmony_tokenize_response(response)
+
+    assert prompt.endswith("<|start|>assistant<|channel|>analysis<|message|>")
+    serving.openai_serving_render.preprocess_chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_harmony_tokenize_reasoning_prefill_continuation():
+    mock_engine = _build_mock_engine(model_type="gpt_oss")
+    serving = _build_serving_tokenization(mock_engine)
+    serving.openai_serving_render.preprocess_chat = AsyncMock(
+        side_effect=AssertionError("Harmony tokenization must use Harmony rendering")
+    )
+
+    request = TokenizeChatRequest(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "user", "content": "What is 1 + 1?"},
+            {
+                "role": "assistant",
+                "reasoning": "We know 1 + 1 is",
+                "content": "",
+            },
+        ],
+        add_generation_prompt=False,
+        continue_final_message=True,
+        chat_template_kwargs={
+            "continuation_mode": "from_reasoning",
+            "enable_thinking": True,
+        },
+    )
+
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+    prompt = _decode_harmony_tokenize_response(response)
+
+    assert prompt.endswith("We know 1 + 1 is")
+    assert "<|channel|>analysis<|message|>We know 1 + 1 is" in prompt
+    assert "<|channel|>final<|message|>" not in prompt
+    serving.openai_serving_render.preprocess_chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_harmony_tokenize_answer_prefill_continuation():
+    mock_engine = _build_mock_engine(model_type="gpt_oss")
+    serving = _build_serving_tokenization(mock_engine)
+    serving.openai_serving_render.preprocess_chat = AsyncMock(
+        side_effect=AssertionError("Harmony tokenization must use Harmony rendering")
+    )
+
+    request = TokenizeChatRequest(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "user", "content": "What is 1 + 1?"},
+            {
+                "role": "assistant",
+                "reasoning": "We already computed it.",
+                "content": "The answer is",
+            },
+        ],
+        add_generation_prompt=False,
+        continue_final_message=True,
+        chat_template_kwargs={
+            "continuation_mode": "from_answer",
+            "enable_thinking": True,
+        },
+    )
+
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+    prompt = _decode_harmony_tokenize_response(response)
+
+    assert "<|channel|>analysis<|message|>We already computed it.<|end|>" in prompt
+    assert "<|channel|>final<|message|>The answer is" in prompt
+    assert prompt.endswith("The answer is")
+    serving.openai_serving_render.preprocess_chat.assert_not_called()

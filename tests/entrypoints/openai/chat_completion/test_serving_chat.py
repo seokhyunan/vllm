@@ -637,7 +637,7 @@ async def test_serving_chat_returns_correct_model_name():
     serving_chat = _build_serving_chat(mock_engine)
     messages = [{"role": "user", "content": "what is 1+1?"}]
 
-    async def return_model_name(*args):
+    async def return_model_name(*args, **kwargs):
         return args[3]
 
     serving_chat.chat_completion_full_generator = return_model_name
@@ -1362,6 +1362,43 @@ class TestServingChatWithHarmony:
                 # of the subsequent assistant message to the final channel.
                 {"role": "assistant", "channel": "final", "content": final_str},
             ],
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_reasoning_prefill_full_response(self, serving_chat):
+        messages = [
+            {"role": "user", "content": "What is 1 + 1?"},
+            {
+                "role": "assistant",
+                "reasoning": "We know 1 + 1 is",
+                "content": "",
+            },
+        ]
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=messages,
+            add_generation_prompt=False,
+            continue_final_message=True,
+            chat_template_kwargs={
+                "continuation_mode": "from_reasoning",
+                "enable_thinking": True,
+            },
+        )
+
+        reasoning_suffix = " 2. Provide the short answer."
+        final_str = "2"
+        response_str = (
+            f"{reasoning_suffix}<|end|>"
+            f"<|start|>assistant<|channel|>final<|message|>{final_str}<|return|>"
+        )
+
+        response = await self.generate_response_from_harmony_str(
+            serving_chat, req, response_str, stream=False
+        )
+        verify_chat_response(
+            response,
+            content=final_str,
+            reasoning=reasoning_suffix,
         )
 
     @pytest.mark.asyncio

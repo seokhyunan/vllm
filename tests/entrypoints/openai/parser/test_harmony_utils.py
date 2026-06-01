@@ -12,6 +12,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     get_system_message,
     has_custom_tools,
     is_function_recipient,
+    normalize_chat_output_with_prefill,
     parse_chat_input_to_harmony_message,
     parse_chat_output,
 )
@@ -884,6 +885,71 @@ class TestAutoDropAnalysisMessages:
 
 
 class TestParseChatOutput:
+    def test_normalize_chat_output_with_prefill_from_reasoning(self) -> None:
+        harmony_str = (
+            " 2. Provide the short answer.<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>2<|return|>"
+        )
+        token_ids = get_encoding().encode(harmony_str, allowed_special="all")
+        normalized_token_ids = normalize_chat_output_with_prefill(
+            token_ids,
+            chat_msgs=[
+                {"role": "user", "content": "What is 1 + 1?"},
+                {
+                    "role": "assistant",
+                    "reasoning": "We know 1 + 1 is",
+                    "content": "",
+                },
+            ],
+            chat_template_kwargs={
+                "continuation_mode": "from_reasoning",
+                "enable_thinking": True,
+            },
+            continue_final_message=True,
+        )
+
+        expected_token_ids = get_encoding().encode(
+            "<|channel|>analysis<|message|>" + harmony_str,
+            allowed_special="all",
+        )
+        assert normalized_token_ids == expected_token_ids
+
+    def test_normalize_chat_output_with_prefill_does_not_double_prefix(self) -> None:
+        harmony_str = "<|channel|>final<|message|>The answer is 2.<|return|>"
+        token_ids = get_encoding().encode(harmony_str, allowed_special="all")
+
+        normalized_token_ids = normalize_chat_output_with_prefill(
+            token_ids,
+            chat_template_kwargs={"continuation_mode": "from_reasoning"},
+            continue_final_message=True,
+        )
+
+        assert normalized_token_ids == token_ids
+
+    def test_normalize_chat_output_with_prefill_from_answer(self) -> None:
+        harmony_str = " is 2.<|return|>"
+        token_ids = get_encoding().encode(harmony_str, allowed_special="all")
+
+        normalized_token_ids = normalize_chat_output_with_prefill(
+            token_ids,
+            chat_msgs=[
+                {"role": "user", "content": "What is 1 + 1?"},
+                {
+                    "role": "assistant",
+                    "reasoning": "We know 1 + 1 is 2.",
+                    "content": "The answer",
+                },
+            ],
+            chat_template_kwargs={"continuation_mode": "from_answer"},
+            continue_final_message=True,
+        )
+
+        expected_token_ids = get_encoding().encode(
+            "<|channel|>final<|message|>" + harmony_str,
+            allowed_special="all",
+        )
+        assert normalized_token_ids == expected_token_ids
+
     def test_parse_chat_output_interrupted_first_message(self) -> None:
         harmony_str = "<|channel|>final<|message|>I'm in the middle of answering"
         token_ids = get_encoding().encode(harmony_str, allowed_special="all")
