@@ -19,8 +19,11 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.parser.harmony_utils import (
     extract_function_from_recipient,
+    get_final_prefill_content,
+    get_harmony_completion_channel,
     get_streamable_parser_for_assistant,
     is_function_recipient,
+    normalize_chat_output_with_prefill,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.parser.abstract_parser import DelegatingParser
@@ -85,6 +88,9 @@ class HarmonyParser(DelegatingParser):
         self._harmony_parser = get_streamable_parser_for_assistant()
         self._next_tool_call_index = 0
         self._num_processed_messages = 0
+        # Read (do not pop) so chat_template_kwargs is still forwarded to the
+        # reasoning parser by the base Parser.__init__.
+        self._chat_template_kwargs = kwargs.get("chat_template_kwargs")
 
     @property
     def state(self) -> HarmonyStreamState:
@@ -122,7 +128,19 @@ class HarmonyParser(DelegatingParser):
         Tool calls are always extracted regardless of ``enable_auto_tools``.
         Callers must decide whether to surface them.
         """
-        result = self.process_chunk(model_output_token_ids)
+        token_ids = model_output_token_ids
+        if isinstance(request, ChatCompletionRequest):
+            # Re-attach the open Harmony channel header that the prompt left
+            # open (continuation/prefill) so the output parses with the same
+            # token stream the parser expects. No-op when the output already
+            # starts with a Harmony message header (the common case).
+            token_ids = normalize_chat_output_with_prefill(
+                model_output_token_ids,
+                chat_msgs=request.messages,
+                chat_template_kwargs=self._chat_template_kwargs,
+                continue_final_message=request.continue_final_message,
+            )
+        result = self.process_chunk(token_ids)
 
         reasoning_parts: list[str] = []
         content_parts: list[str] = []
@@ -183,6 +201,24 @@ class HarmonyParser(DelegatingParser):
 
         reasoning = "\n".join(reasoning_parts) or None
         content = "\n".join(content_parts) or None
+
+        # When echoing a continued final turn, prepend the assistant prefill
+        # that the model continued from.
+        if (
+            isinstance(request, ChatCompletionRequest)
+            and request.echo
+            and request.continue_final_message
+            and get_harmony_completion_channel(
+                request.messages,
+                self._chat_template_kwargs,
+                continue_final_message=True,
+            )
+            == "final"
+        ):
+            final_prefill = get_final_prefill_content(request.messages)
+            if final_prefill:
+                content = final_prefill + (content or "")
+
         return reasoning, content, tool_calls or None
 
     def parse_delta(

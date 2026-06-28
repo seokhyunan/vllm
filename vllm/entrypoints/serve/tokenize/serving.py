@@ -6,6 +6,7 @@ from typing import Any, Final
 from fastapi import Request
 
 from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.models.serving import (
     OpenAIModelRegistry,
@@ -73,23 +74,45 @@ class ServingTokenization(BaseServing):
                 if request.tools is None
                 else [tool.model_dump() for tool in request.tools]
             )
-            error_check_ret = self.openai_serving_render.validate_chat_template(
-                request_chat_template=request.chat_template,
-                chat_template_kwargs=request.chat_template_kwargs,
-                trust_request_chat_template=self.trust_request_chat_template,
-            )
-            if error_check_ret is not None:
-                return error_check_ret
+            if self.openai_serving_render.use_harmony:
+                # GPT-OSS renders via Harmony, not the Jinja chat template, so
+                # route tokenization through the same harmony path the chat and
+                # render endpoints use (keeps continuation/prefill consistent).
+                chat_request = ChatCompletionRequest(
+                    model=request.model,
+                    messages=request.messages,
+                    tools=request.tools,
+                    add_generation_prompt=request.add_generation_prompt,
+                    continue_final_message=request.continue_final_message,
+                    chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    media_io_kwargs=request.media_io_kwargs,
+                    mm_processor_kwargs=request.mm_processor_kwargs,
+                )
+                _, engine_inputs = (
+                    self.openai_serving_render._make_request_with_harmony(
+                        chat_request,
+                        should_include_tools=request.tools is not None,
+                    )
+                )
+            else:
+                error_check_ret = self.openai_serving_render.validate_chat_template(
+                    request_chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    trust_request_chat_template=self.trust_request_chat_template,
+                )
+                if error_check_ret is not None:
+                    return error_check_ret
 
-            _, engine_inputs = await self.openai_serving_render.preprocess_chat(
-                request,
-                request.messages,
-                default_template=self.chat_template,
-                default_template_content_format=self.chat_template_content_format,
-                default_template_kwargs=self.default_chat_template_kwargs,
-                tool_dicts=tool_dicts,
-                skip_mm_cache=True,
-            )
+                _, engine_inputs = await self.openai_serving_render.preprocess_chat(
+                    request,
+                    request.messages,
+                    default_template=self.chat_template,
+                    default_template_content_format=self.chat_template_content_format,
+                    default_template_kwargs=self.default_chat_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    skip_mm_cache=True,
+                )
         else:
             engine_inputs = await self.openai_serving_render.preprocess_completion(
                 request,
